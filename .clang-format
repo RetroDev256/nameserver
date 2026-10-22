@@ -1,0 +1,15 @@
+BasedOnStyle: LLVM
+AlignTrailingComments: false
+
+AllowShortIfStatementsOnASingleLine: true
+AllowShortBlocksOnASingleLine: true
+AllowShortLoopsOnASingleLine: true
+
+ContinuationIndentWidth: 4
+IndentCaseLabels: true
+ColumnLimit: 80
+IndentWidth: 4
+
+BreakFunctionDefinitionParameters: false
+AlignAfterOpenBracket: BlockIndent
+BinPackParameters: false
