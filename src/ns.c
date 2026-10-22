@@ -5,25 +5,27 @@
 // - "a.b.rng": returns random number in [a, a + b) - TXT and A
 // ----------------------------------------------------------------------------
 
-#include <arpa/inet.h> // htons/ntohs (byte order), in6addr_any
-#include <netinet/in.h> // sockaddr_in6, IPPROTO_*, IPV6_V6ONLY
-#include <stdint.h> // fixed-width ints: uint8_t, uint16_t
-#include <stdio.h> // perror
-#include <stdlib.h> // exit
-#include <string.h> // memcpy, memset, strlen
-#include <sys/socket.h> // socket, bind, recvfrom, sendto
-#include <unistd.h> // close
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 // number of bytes in the DNS header - 6x 16-bit fields is 12 bytes
 #define HEADER_SIZE 12
 // 253 bytes is the max size of a parsed QNAME - first and last marker removed
 #define QNAME_SIZE 253
 // 512 bytes is the max size of a UDP DNS message - RFC 1035 2.3.4
-#define BUF_SIZE 512
-// TYPE value for TXT resource records - RFC 1035 3.2.2
-#define TYPE_TXT 16
+#define DNS_BUF_SIZE 512
 // CLASS value for the internet - RFC 1035 3.2.4
 #define CLASS_IN 1
+
+// TYPE values for resource records - RFC 1035 3.2.2
+#define TYPE_A 1 // a host address
+#define TYPE_TXT 16 // text strings
 
 // DNS header definition - RFC 1035 4.1.1
 struct dns_header {
@@ -86,8 +88,7 @@ int parse_question(
     const size_t len,
     uint8_t *const restrict q_name,
     uint16_t *const restrict q_type,
-    uint16_t *const restrict q_class,
-    size_t *const restrict q_length
+    uint16_t *const restrict q_class
 ) {
     // there is no room for a question within the packet
     if (*off >= len) return -1;
@@ -160,8 +161,6 @@ int parse_question(
     *q_class = ntohs(*q_class);
     *off += 2;
 
-    // set the length of the QNAME
-    *q_length = write;
     // add a null-character delimiter to qname
     q_name[write] = 0;
 
@@ -172,11 +171,10 @@ int parse_question(
 // Write a response into output packet, with given name, type, TTL, and data.
 // Returns 0 on success, -1 on failure. Format defined in RFC 1035 4.1.3.
 // ----------------------------------------------------------------------------
-int write_response(
-    uint8_t *const restrict packet,
+int resource(
+    uint8_t *const packet,
     size_t *const restrict off,
-    const size_t len,
-    const uint8_t *const restrict name,
+    const uint8_t *const name,
     const size_t name_len,
     const uint16_t type,
     const uint32_t time_to_live,
@@ -184,7 +182,7 @@ int write_response(
     const uint16_t data_len
 ) {
     // there is no room for this response in the packet
-    if (*off + name_len + data_len + 10 > len) return -1;
+    if (*off + name_len + data_len + 10 > DNS_BUF_SIZE) return -1;
 
     // write the name into the output packet
     memcpy(packet + *off, name, name_len);
@@ -217,12 +215,81 @@ int write_response(
     return 0;
 }
 
+// ----------------------------------------------------------------------------
+// Encode TXT resource from a string. r_data must have room for 256 bytes.
+// Returns 0 on success, -1 on failure.  Format defined in RFC 1035 3.3.14.
+// ----------------------------------------------------------------------------
+int encode_txt_resource(
+    const char *const restrict text,
+    uint8_t *const restrict r_data,
+    uint16_t *const restrict r_data_len
+) {
+    size_t len = strlen(text);
+    if (len > 255) return -1;
+
+    r_data[0] = (uint8_t)len;
+    memcpy(r_data + 1, text, len);
+    *r_data_len = len + 1;
+    return 0;
+}
+
+// ----------------------------------------------------------------------------
+// Encode A resource from a string. r_data must have room for 4 bytes.
+// Format defined in RFC 1035 3.4.1.
+// ----------------------------------------------------------------------------
+void encode_a_resource(
+    const uint32_t value,
+    uint8_t *const restrict r_data,
+    uint16_t *const restrict r_data_len
+) {
+    uint32_t network = htonl(value);
+    memcpy(r_data, &network, 4);
+    *r_data_len = 4;
+}
+
+// ----------------------------------------------------------------------------
+// Change the request header to a response header. RFC 1035 4.1.1.
+// ----------------------------------------------------------------------------
+void set_response(uint8_t *const buf, uint16_t an_count) {
+    // copy OPCODE and RD, mark response and authority
+    buf[2] = 0x84 | (buf[2] & 0x79);
+    // clear RA, Z, and RCODE
+    buf[3] = 0x00;
+
+    // set the number of answers in the header
+    an_count = htons(an_count);
+    memcpy(buf + 6, &an_count, 2);
+
+    // no records in the authority section
+    buf[8] = 0x00, buf[9] = 0x00;
+    // no records in the additional section
+    buf[10] = 0x00, buf[11] = 0x00;
+}
+
+// ----------------------------------------------------------------------------
+// Change the request header to a format-error response header. RFC 1035 4.1.1.
+// ----------------------------------------------------------------------------
+void set_format_error_response(uint8_t *const buf) {
+    // copy OPCODE and RD, mark response and authority
+    buf[2] = 0x84 | (buf[2] & 0x79);
+    // set format-error
+    buf[3] = 0x01;
+
+    // no entries in the questions section
+    buf[4] = 0x00, buf[5] = 0x00;
+    // no records in the answer section
+    buf[6] = 0x00, buf[7] = 0x00;
+    // no records in the authority section
+    buf[8] = 0x00, buf[9] = 0x00;
+    // no records in the additional section
+    buf[10] = 0x00, buf[11] = 0x00;
+}
+
 int main(void) {
     // create and bind IPv4/IPv6 UDP socket on port 53
     int sock = create_ns_socket();
 
-    uint8_t i_buf[BUF_SIZE];
-    uint8_t o_buf[BUF_SIZE];
+    uint8_t buf[DNS_BUF_SIZE];
 
     // store address of an IPv4 or IPv6 client
     struct sockaddr_in6 client_addr;
@@ -231,85 +298,57 @@ int main(void) {
 
     while (1) {
         // recieve a DNS query and store client's address
-        ssize_t n = recvfrom(sock, i_buf, BUF_SIZE, 0, ca_ptr, &ca_len);
+        ssize_t n = recvfrom(sock, buf, DNS_BUF_SIZE, 0, ca_ptr, &ca_len);
         // ignore all incomplete packets (smaller than DNS header)
-        if (n < HEADER_SIZE) continue;
+        if (n < HEADER_SIZE) goto format_error;
 
+        struct dns_header header;
         // copy from buffer into the header
-        struct dns_header i_header;
-        memcpy(&i_header, i_buf, sizeof(i_header));
-
-        uint16_t flags = ntohs(i_header.flags);
+        memcpy(&header, buf, sizeof(header));
         // QR flag - ignore packets identifying as a response
-        if (flags & 0x8000) continue;
-
-        uint16_t qd_count = ntohs(i_header.qd_count);
+        if (ntohs(header.flags) & 0x8000) goto format_error;
         // QDCOUNT - ignore packets not asking one question
-        if (qd_count != 1) continue;
-
-        // The +1 is to make q_name a null-terminated string, but do note that
-        // RFC 1035 never says the QNAME won't have null characters within it,
-        // so rely on q_length instead of C-string functions.
-        uint8_t q_name[QNAME_SIZE + 1];
-        uint16_t q_type, q_class;
-        size_t q_length;
+        if (ntohs(header.qd_count) != 1) goto format_error;
 
         size_t off = HEADER_SIZE; // question starts after header
-        int err = parse_question(
-            i_buf, &off, n, q_name, &q_type, &q_class, &q_length
-        );
+        uint8_t q_name[QNAME_SIZE + 1]; // +1 for null terminated string
+        uint16_t q_type, q_class; // type and class of asked question
 
-        // ignore the packet if there was a problem parsing the question
-        if (err) continue;
-        // ignore the packet if it isn't asking for ordinary DNS data
-        if (q_class != CLASS_IN) continue;
-        // ignore the packet if it isn't asking for TXT records
-        if (q_type != TYPE_TXT) continue;
+        int err = parse_question(buf, &off, n, q_name, &q_type, &q_class);
+        const uint16_t rq_len = off - HEADER_SIZE - 4;
+        const uint8_t *const raw_q = buf + HEADER_SIZE;
 
-        struct dns_header o_header = {
-            // match the response to the query
-            .id = i_header.id,
-            // copy OPCODE and RD, mark response and authority
-            .flags = htons(0x8400 | (flags & 0x7900)),
-            // copy question count (used to doubly verify)
-            .qd_count = i_header.qd_count,
-            // one record in answer section (response)
-            .an_count = htons(1),
-            // no records in authority section
-            .ns_count = htons(0),
-            // no records in additional section
-            .ar_count = htons(0),
-        };
+        // there was a problem parsing the question
+        if (err) goto format_error;
+        // the isn't asking for ordinary DNS data
+        if (q_class != CLASS_IN) goto format_error;
+        // change the packet so it can be used to respond to requests
+        set_response(buf, 1);
 
-        // copy the new header to the output buffer
-        memcpy(o_buf, &o_header, HEADER_SIZE);
-        // copy the original question to the output buffer
-        memcpy(o_buf + HEADER_SIZE, i_buf + HEADER_SIZE, off - HEADER_SIZE);
+        uint8_t r_data[256];
+        uint16_t rd_len;
 
-        static const uint8_t text[] = "Hello, World!\nThis is fun!";
-        const uint16_t text_len = sizeof(text) - 1;
+        switch (q_type) {
+            case TYPE_TXT:
+                err = encode_txt_resource("Hello, World!", r_data, &rd_len);
+                if (err) goto format_error;
+                break;
+            case TYPE_A:
+                encode_a_resource(0xFFBB7733, r_data, &rd_len);
+                break;
+        }
 
-        // TXT RDATA starts with 1 byte for length
-        uint16_t r_data_len = 1 + text_len;
-        uint8_t r_data[r_data_len];
-        memcpy(r_data + 1, text, text_len);
-        r_data[0] = text_len; // set length
+        // sending resource with 0 TTL to help prevent caching
+        err = resource(buf, &off, raw_q, rq_len, q_type, 0, r_data, rd_len);
 
-        err = write_response(
-            o_buf, &off, BUF_SIZE,
-            // QNAME starts after the input header
-            i_buf + HEADER_SIZE,
-            // QNAME length exclusdes QTYPE and QCLASS
-            off - HEADER_SIZE - 4,
-            // sending TEXT with 0 TTL to prevent caching
-            TYPE_TXT, 0, r_data, r_data_len
-        );
+        // succeeded writing resource
+        if (!err) goto send_response;
 
-        // skip packet if we failed to write a response
-        if (err) continue;
+    format_error:
+        set_format_error_response(buf);
 
-        // send the response back
-        sendto(sock, o_buf, off, 0, ca_ptr, ca_len);
+    send_response:
+        sendto(sock, buf, off, 0, ca_ptr, ca_len);
     }
 
     close(sock);
