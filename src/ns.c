@@ -6,6 +6,7 @@
 // ----------------------------------------------------------------------------
 
 #include <arpa/inet.h>
+#include <inttypes.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -45,15 +46,16 @@ struct dns_header {
 
 // ----------------------------------------------------------------------------
 // Create and bind IPv4/IPv6 UDP socket on port 53, open to all interfaces.
+// Returns 0 on success, -1 on failure.
 // ----------------------------------------------------------------------------
-int create_ns_socket() {
+int create_ns_socket(int *sock) {
     // create an IPv6 UDP [SOCK_DGRAM + IPPROTO_UDP] socket
-    int sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) goto error;
+    *sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (*sock < 0) goto error;
 
     // explicitly accept both IPv4 and IPv6 packets
     int ipv6_only = 0, level = IPPROTO_IPV6, name = IPV6_V6ONLY;
-    if (setsockopt(sock, level, name, &ipv6_only, sizeof(ipv6_only)))
+    if (setsockopt(*sock, level, name, &ipv6_only, sizeof(ipv6_only)))
         goto error;
 
     // describe local address to listen on
@@ -64,18 +66,18 @@ int create_ns_socket() {
     };
 
     // attach opened socket to that address and port
-    if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)))
+    if (bind(*sock, (struct sockaddr *)&server_addr, sizeof(server_addr)))
         goto error;
 
-    return sock;
+    return 0;
 
 error:
     // display error message
     perror(NULL);
     // close any opened socket
-    if (sock >= 0) close(sock);
-    // terminate program with error
-    exit(1);
+    if (sock >= 0) close(*sock);
+    // signal error occurred
+    return -1;
 }
 
 // ----------------------------------------------------------------------------
@@ -86,7 +88,7 @@ int parse_question(
     const uint8_t *const restrict packet,
     size_t *const restrict off,
     const size_t len,
-    uint8_t *const restrict q_name,
+    char *const restrict q_name,
     uint16_t *const restrict q_type,
     uint16_t *const restrict q_class
 ) {
@@ -199,7 +201,7 @@ int resource(
     *off += 2;
 
     // write the TTL into the output packet
-    uint16_t ttl_network = htonl(time_to_live);
+    uint32_t ttl_network = htonl(time_to_live);
     memcpy(packet + *off, &ttl_network, 4);
     *off += 4;
 
@@ -248,7 +250,7 @@ void encode_a_resource(
 }
 
 // ----------------------------------------------------------------------------
-// Change the request header to a response header. RFC 1035 4.1.1.
+// Change request header to a response header. RFC 1035 4.1.1.
 // ----------------------------------------------------------------------------
 void set_response(uint8_t *const buf, uint16_t an_count) {
     // copy OPCODE and RD, mark response and authority
@@ -267,7 +269,7 @@ void set_response(uint8_t *const buf, uint16_t an_count) {
 }
 
 // ----------------------------------------------------------------------------
-// Change the request header to a format-error response header. RFC 1035 4.1.1.
+// Change request header to a format-error response header. RFC 1035 4.1.1.
 // ----------------------------------------------------------------------------
 void set_format_error_response(uint8_t *const buf) {
     // copy OPCODE and RD, mark response and authority
@@ -275,8 +277,6 @@ void set_format_error_response(uint8_t *const buf) {
     // set format-error
     buf[3] = 0x01;
 
-    // no entries in the questions section
-    buf[4] = 0x00, buf[5] = 0x00;
     // no records in the answer section
     buf[6] = 0x00, buf[7] = 0x00;
     // no records in the authority section
@@ -285,34 +285,75 @@ void set_format_error_response(uint8_t *const buf) {
     buf[10] = 0x00, buf[11] = 0x00;
 }
 
+// ----------------------------------------------------------------------------
+// Change request header to a server-failure response header. RFC 1035 4.1.1.
+// ----------------------------------------------------------------------------
+void set_server_failure_response(uint8_t *const buf) {
+    // copy OPCODE and RD, mark response and authority
+    buf[2] = 0x84 | (buf[2] & 0x79);
+    // set server-failure
+    buf[3] = 0x02;
+
+    // no records in the answer section
+    buf[6] = 0x00, buf[7] = 0x00;
+    // no records in the authority section
+    buf[8] = 0x00, buf[9] = 0x00;
+    // no records in the additional section
+    buf[10] = 0x00, buf[11] = 0x00;
+}
+
+// ----------------------------------------------------------------------------
+// Read a uint32_t from /dev/urandom. Returns 0 on success, -1 on failure.
+// ----------------------------------------------------------------------------
+int read_random_u32(uint32_t *const number) {
+    FILE *file = fopen("/dev/urandom", "r");
+    if (file == NULL) goto error;
+
+    // read one item - 4 bytes - into number
+    size_t count = fread(number, 4, 1, file);
+    if (count == 0) goto error;
+
+    fclose(file);
+    return 0;
+
+error:
+    // display error message
+    perror(NULL);
+    // close any open file
+    if (file != NULL) fclose(file);
+    // signal error occurred
+    return -1;
+}
+
 int main(void) {
+    int sock;
     // create and bind IPv4/IPv6 UDP socket on port 53
-    int sock = create_ns_socket();
-
-    uint8_t buf[DNS_BUF_SIZE];
-
-    // store address of an IPv4 or IPv6 client
-    struct sockaddr_in6 client_addr;
-    socklen_t ca_len = sizeof(client_addr);
-    struct sockaddr *ca_ptr = (struct sockaddr *)&client_addr;
+    if (create_ns_socket(&sock)) return 1;
 
     while (1) {
+        uint8_t buf[DNS_BUF_SIZE];
+
+        // store address of an IPv4 or IPv6 client
+        struct sockaddr_in6 client_addr;
+        socklen_t ca_len = sizeof(client_addr);
+        struct sockaddr *ca_ptr = (struct sockaddr *)&client_addr;
+
         // recieve a DNS query and store client's address
         ssize_t n = recvfrom(sock, buf, DNS_BUF_SIZE, 0, ca_ptr, &ca_len);
         // ignore all incomplete packets (smaller than DNS header)
-        if (n < HEADER_SIZE) goto format_error;
+        if (n < HEADER_SIZE) continue;
+
+        size_t off = HEADER_SIZE; // length/offset of the DNS packet
+        char q_name[QNAME_SIZE + 1]; // +1 for null terminated string
+        uint16_t q_type, q_class; // type and class of asked question
 
         struct dns_header header;
         // copy from buffer into the header
         memcpy(&header, buf, sizeof(header));
         // QR flag - ignore packets identifying as a response
-        if (ntohs(header.flags) & 0x8000) goto format_error;
-        // QDCOUNT - ignore packets not asking one question
+        if (ntohs(header.flags) & 0x8000) continue;
+        // QDCOUNT - respond to packets not asking one question
         if (ntohs(header.qd_count) != 1) goto format_error;
-
-        size_t off = HEADER_SIZE; // question starts after header
-        uint8_t q_name[QNAME_SIZE + 1]; // +1 for null terminated string
-        uint16_t q_type, q_class; // type and class of asked question
 
         int err = parse_question(buf, &off, n, q_name, &q_type, &q_class);
         const uint16_t rq_len = off - HEADER_SIZE - 4;
@@ -328,24 +369,44 @@ int main(void) {
         uint8_t r_data[256];
         uint16_t rd_len;
 
-        switch (q_type) {
-            case TYPE_TXT:
-                err = encode_txt_resource("Hello, World!", r_data, &rd_len);
-                if (err) goto format_error;
-                break;
-            case TYPE_A:
-                encode_a_resource(0xFFBB7733, r_data, &rd_len);
-                break;
+        if (strcmp("rng", q_name) == 0) {
+            uint32_t number;
+            err = read_random_u32(&number);
+            if (err) goto server_failure;
+            char number_buf[11]; // "4294967295\0"
+
+            switch (q_type) {
+                case TYPE_TXT:
+                    err = sprintf(number_buf, "%" PRIu32, number);
+                    if (err < 0) goto server_failure;
+                    err = encode_txt_resource(number_buf, r_data, &rd_len);
+                    if (err) goto server_failure;
+                    break;
+                case TYPE_A:
+                    encode_a_resource(number, r_data, &rd_len);
+                    break;
+                default:
+                    goto format_error;
+            }
+        } else {
+            // only "rng" is supported right now
+            goto format_error;
         }
 
         // sending resource with 0 TTL to help prevent caching
         err = resource(buf, &off, raw_q, rq_len, q_type, 0, r_data, rd_len);
+        if (err) goto server_failure;
 
         // succeeded writing resource
-        if (!err) goto send_response;
+        goto send_response;
 
     format_error:
         set_format_error_response(buf);
+        goto send_response;
+
+    server_failure:
+        set_server_failure_response(buf);
+        goto send_response;
 
     send_response:
         sendto(sock, buf, off, 0, ca_ptr, ca_len);
