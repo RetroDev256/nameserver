@@ -6,12 +6,14 @@
 // ----------------------------------------------------------------------------
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -75,7 +77,7 @@ error:
     // display error message
     perror(NULL);
     // close any opened socket
-    if (sock >= 0) close(*sock);
+    if (*sock >= 0) close(*sock);
     // signal error occurred
     return -1;
 }
@@ -250,78 +252,57 @@ void encode_a_resource(
 }
 
 // ----------------------------------------------------------------------------
-// Change request header to a response header. RFC 1035 4.1.1.
+// Change request header to a response header, set error code. RFC 1035 4.1.1.
 // ----------------------------------------------------------------------------
-void set_response(uint8_t *const buf, uint16_t an_count) {
+void set_error_response(uint8_t *const buf, const uint8_t rcode) {
     // copy OPCODE and RD, mark response and authority
     buf[2] = 0x84 | (buf[2] & 0x79);
-    // clear RA, Z, and RCODE
-    buf[3] = 0x00;
+    // set desired rcode
+    buf[3] = rcode;
+    // no AN, NS, or AR records
+    memset(buf + 6, 0, 6);
+}
+
+// ----------------------------------------------------------------------------
+// Change request header to a valid response header. RFC 1035 4.1.1.
+// ----------------------------------------------------------------------------
+void set_response(uint8_t *const buf, uint16_t an_count) {
+    // buffer is now a response, and with no error
+    set_error_response(buf, 0x00);
 
     // set the number of answers in the header
     an_count = htons(an_count);
     memcpy(buf + 6, &an_count, 2);
-
-    // no records in the authority section
-    buf[8] = 0x00, buf[9] = 0x00;
-    // no records in the additional section
-    buf[10] = 0x00, buf[11] = 0x00;
-}
-
-// ----------------------------------------------------------------------------
-// Change request header to a format-error response header. RFC 1035 4.1.1.
-// ----------------------------------------------------------------------------
-void set_format_error_response(uint8_t *const buf) {
-    // copy OPCODE and RD, mark response and authority
-    buf[2] = 0x84 | (buf[2] & 0x79);
-    // set format-error
-    buf[3] = 0x01;
-
-    // no records in the answer section
-    buf[6] = 0x00, buf[7] = 0x00;
-    // no records in the authority section
-    buf[8] = 0x00, buf[9] = 0x00;
-    // no records in the additional section
-    buf[10] = 0x00, buf[11] = 0x00;
-}
-
-// ----------------------------------------------------------------------------
-// Change request header to a server-failure response header. RFC 1035 4.1.1.
-// ----------------------------------------------------------------------------
-void set_server_failure_response(uint8_t *const buf) {
-    // copy OPCODE and RD, mark response and authority
-    buf[2] = 0x84 | (buf[2] & 0x79);
-    // set server-failure
-    buf[3] = 0x02;
-
-    // no records in the answer section
-    buf[6] = 0x00, buf[7] = 0x00;
-    // no records in the authority section
-    buf[8] = 0x00, buf[9] = 0x00;
-    // no records in the additional section
-    buf[10] = 0x00, buf[11] = 0x00;
 }
 
 // ----------------------------------------------------------------------------
 // Read a uint32_t from /dev/urandom. Returns 0 on success, -1 on failure.
 // ----------------------------------------------------------------------------
-int read_random_u32(uint32_t *const number) {
-    FILE *file = fopen("/dev/urandom", "r");
-    if (file == NULL) goto error;
+int random_u32(uint32_t *const number) {
+    if (getrandom(number, 4, 0) != 4) {
+        perror("getrandom");
+        return -1;
+    } else {
+        return 0;
+    }
+}
 
-    // read one item - 4 bytes - into number
-    size_t count = fread(number, 4, 1, file);
-    if (count == 0) goto error;
+// ----------------------------------------------------------------------------
+// Get random uint32_t in range [a, b). Returns 0 on success, -1 on failure.
+// ----------------------------------------------------------------------------
+int random_u32_range(uint32_t *const number, uint32_t a, uint32_t b) {
+    if(b <= a) return -1;
+    const uint32_t limit = b - a;
+    const uint32_t threshold = (uint32_t)(0 - limit) % limit;
 
-    fclose(file);
-    return 0;
+    for (uint_fast8_t try = 0; try < 64; try++) {
+        if (random_u32(number)) return -1;
+        if (*number < threshold) continue;
+        *number = a + (*number % limit);
+        return 0;
+    }
 
-error:
-    // display error message
-    perror(NULL);
-    // close any open file
-    if (file != NULL) fclose(file);
-    // signal error occurred
+    // PRNG might be broken
     return -1;
 }
 
@@ -339,13 +320,9 @@ int main(void) {
         struct sockaddr *ca_ptr = (struct sockaddr *)&client_addr;
 
         // recieve a DNS query and store client's address
-        ssize_t n = recvfrom(sock, buf, DNS_BUF_SIZE, 0, ca_ptr, &ca_len);
+        ssize_t len = recvfrom(sock, buf, DNS_BUF_SIZE, 0, ca_ptr, &ca_len);
         // ignore all incomplete packets (smaller than DNS header)
-        if (n < HEADER_SIZE) continue;
-
-        size_t off = HEADER_SIZE; // length/offset of the DNS packet
-        char q_name[QNAME_SIZE + 1]; // +1 for null terminated string
-        uint16_t q_type, q_class; // type and class of asked question
+        if (len < HEADER_SIZE) continue;
 
         struct dns_header header;
         // copy from buffer into the header
@@ -353,44 +330,69 @@ int main(void) {
         // QR flag - ignore packets identifying as a response
         if (ntohs(header.flags) & 0x8000) continue;
         // QDCOUNT - respond to packets not asking one question
-        if (ntohs(header.qd_count) != 1) goto format_error;
+        if (ntohs(header.qd_count) != 1) goto bad_query;
 
-        int err = parse_question(buf, &off, n, q_name, &q_type, &q_class);
+        size_t off = HEADER_SIZE; // length/offset of the DNS packet
+        char q_name[QNAME_SIZE + 1]; // +1 for null terminated string
+        uint16_t q_type, q_class; // type and class of asked question
+
+        int err = parse_question(buf, &off, len, q_name, &q_type, &q_class);
         const uint16_t rq_len = off - HEADER_SIZE - 4;
         const uint8_t *const raw_q = buf + HEADER_SIZE;
 
         // there was a problem parsing the question
-        if (err) goto format_error;
-        // the isn't asking for ordinary DNS data
+        if (err) goto bad_query;
+        // the request isn't asking for ordinary DNS data
         if (q_class != CLASS_IN) goto format_error;
+        //  only TXT and A type queries are supported
+        if (q_type != TYPE_A && q_type != TYPE_TXT) {
+            set_response(buf, 0);
+            goto send_response;
+        }
+
         // change the packet so it can be used to respond to requests
         set_response(buf, 1);
 
         uint8_t r_data[256];
         uint16_t rd_len;
 
-        if (strcmp("rng", q_name) == 0) {
-            uint32_t number;
-            err = read_random_u32(&number);
-            if (err) goto server_failure;
-            char number_buf[11]; // "4294967295\0"
+        // some resolvers mess with casing - lowercase q_name
+        for (int i = 0; q_name[i]; i++)
+            q_name[i] = tolower((unsigned char)q_name[i]);
 
-            switch (q_type) {
-                case TYPE_TXT:
-                    err = sprintf(number_buf, "%" PRIu32, number);
-                    if (err < 0) goto server_failure;
-                    err = encode_txt_resource(number_buf, r_data, &rd_len);
-                    if (err) goto server_failure;
-                    break;
-                case TYPE_A:
-                    encode_a_resource(number, r_data, &rd_len);
-                    break;
-                default:
-                    goto format_error;
-            }
+        int n;
+        uint32_t a, b, number;
+        char number_buf[11]; // "4294967295\0"
+
+        const char *r2 = "%" SCNu32 ".rng%n";
+        const char *r3 = "%" SCNu32 ".%" SCNu32 ".rng%n";
+
+        if (strcmp(q_name, "rng") == 0) {
+            // return random u32 if "rng" is queried
+            if (random_u32(&number)) goto server_failure;
+        } else if (n = 0, sscanf(q_name, r2, &a, &n) == 1 && !q_name[n]) {
+            // return random u32 below 'a' if "a.rng" is queried
+            if (a == 0) goto format_error;
+            if (random_u32_range(&number, 0, a)) goto server_failure;
+        } else if (n = 0, sscanf(q_name, r3, &a, &b, &n) == 2 && !q_name[n]) {
+            // return random u32 in range [a, a + b) if "a.b.rng" is queried
+            if (b == 0 || b > UINT32_MAX - a) goto format_error;
+            if (random_u32_range(&number, a, a + b)) goto server_failure;
         } else {
             // only "rng" is supported right now
             goto format_error;
+        }
+
+        switch (q_type) {
+            case TYPE_A:
+                encode_a_resource(number, r_data, &rd_len);
+                break;
+            case TYPE_TXT:
+                err = snprintf(number_buf, 11, "%" PRIu32, number);
+                if (err < 0) goto server_failure;
+                err = encode_txt_resource(number_buf, r_data, &rd_len);
+                if (err) goto server_failure;
+                break;
         }
 
         // sending resource with 0 TTL to help prevent caching
@@ -400,12 +402,20 @@ int main(void) {
         // succeeded writing resource
         goto send_response;
 
+    bad_query:
+        off = HEADER_SIZE;
+        set_error_response(buf, 0x01); // format-error
+        buf[4] = 0x00, buf[5] = 0x00;
+        goto send_response;
+
     format_error:
-        set_format_error_response(buf);
+        off = len;
+        set_error_response(buf, 0x01); // format-error
         goto send_response;
 
     server_failure:
-        set_server_failure_response(buf);
+        off = len;
+        set_error_response(buf, 0x02); // server-failure
         goto send_response;
 
     send_response:
